@@ -78,8 +78,13 @@ test("four peers commit-reveal a fair role deal; each peer privately sees only i
     await a.getByRole("button", { name: /deal roles/i }).click();
 
     // Each phone auto-generates its salt and publishes its SHA-256 commitment
-    // to the shared commits map; once all 4 commitments land, advance to
-    // reveal. We trigger from peer B to prove any peer can drive the phase.
+    // to the shared commits map. Every peer must SEE all four commitments land
+    // (the count is read from the shared Yjs map, so "4 / 4" on peer B proves
+    // A/C/D's commitments crossed the mesh — not just B's own).
+    await expect(b.locator(".mafia-help")).toContainText("Committed: 4 / 4", { timeout: 15_000 });
+
+    // Once all 4 commitments are in, advance to reveal. We trigger from peer B
+    // to prove any peer can drive the phase, not just the dealer.
     const revealBtn = b.getByRole("button", { name: /all committed/i });
     await expect(revealBtn).toBeEnabled({ timeout: 15_000 });
     await revealBtn.click();

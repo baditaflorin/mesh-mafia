@@ -148,8 +148,9 @@ export function Mafia({ roomId, myName, mafiaCount }: Props) {
           one phone (and no server) chooses who's the wolf.
         </p>
         <p>
-          Open this link on every phone in your group. Each player types their name and joins the
-          lobby; anyone can press <em>Deal roles</em> to start.
+          Open this link on every phone in your group — you need <strong>at least 4 players</strong>
+          in the same room. Each player sets their name and joins the lobby; once 4+ are in, anyone
+          can press <em>Deal roles</em> to start.
         </p>
         <button type="button" className="mafia-arm-button" onClick={() => setArmed(true)}>
           Join lobby as {myName || "(set name in Settings)"}
@@ -161,6 +162,8 @@ export function Mafia({ roomId, myName, mafiaCount }: Props) {
   const myRole = roles[myId];
   const allCommitted = players.length > 0 && players.every((p) => p.id in commitments);
   const allRevealed = players.length > 0 && players.every((p) => p.id in reveals);
+  const waitingOnCommit = players.filter((p) => !(p.id in commitments)).map((p) => p.name);
+  const waitingOnReveal = players.filter((p) => !(p.id in reveals)).map((p) => p.name);
 
   return (
     <div className={`mafia-stage mafia-phase-${phase} ${myRole ? `mafia-role-${myRole}` : ""}`}>
@@ -196,6 +199,9 @@ export function Mafia({ roomId, myName, mafiaCount }: Props) {
           </p>
           <p className="mafia-help">
             Committed: {Object.keys(commitments).length} / {players.length}
+            {!allCommitted && waitingOnCommit.length > 0
+              ? ` · waiting on ${waitingOnCommit.join(", ")}`
+              : ""}
           </p>
           <button type="button" disabled={!allCommitted} onClick={() => advance("reveal")}>
             All committed → reveal
@@ -209,6 +215,9 @@ export function Mafia({ roomId, myName, mafiaCount }: Props) {
           <p className="mafia-help">
             Revealed: {Object.keys(reveals).length} / {players.length}
             {allRevealed && myRole ? " · roles dealt" : ""}
+            {!allRevealed && waitingOnReveal.length > 0
+              ? ` · waiting on ${waitingOnReveal.join(", ")}`
+              : ""}
           </p>
           {myRole && (
             <>
