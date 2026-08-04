@@ -3,8 +3,9 @@ import { createRoomSync } from "../sync/yjsRoom";
 import { createClockSync } from "../sync/clockSync";
 import { maybeFetchTurnCredentials } from "../sync/iceConfig";
 import { combineSeeds, commitSeed, randomSeedHex, seededShuffle, verifyCommit } from "./crypto";
+import { assignRoles, type Role } from "./roles";
 
-export type Role = "mafia" | "villager";
+export type { Role };
 export type Phase = "lobby" | "commit" | "reveal" | "night" | "day";
 
 type Player = { id: string; name: string };
@@ -23,8 +24,24 @@ export function Mafia({ roomId, myName, mafiaCount }: Props) {
   const [players, setPlayers] = useState<Player[]>([]);
   const [commitments, setCommitments] = useState<Record<string, Commit>>({});
   const [reveals, setReveals] = useState<Record<string, Reveal>>({});
-  const [roles, setRoles] = useState<Record<string, Role>>({});
+  // Deliberately NOT `Record<peerId, Role>` for every player: only this
+  // peer's own role (plus, if mafia, its teammates' ids — mafia are meant to
+  // know each other) ever lands in component state. The full role map is
+  // computed transiently inside the reveal effect below and discarded, so
+  // no other player's role is ever readable from this peer's own React
+  // state / devtools. See ADR gap: role assignment is a pure function of
+  // PUBLIC data (the revealed seeds), so any peer *could* compute everyone's
+  // role locally — the fix here is to not persist that computation.
+  const [myRole, setMyRole] = useState<Role | undefined>(undefined);
+  const [mafiaTeammateIds, setMafiaTeammateIds] = useState<string[]>([]);
   const [myId, setMyId] = useState("");
+  // mafiaCount as agreed by the table for the round in progress, published
+  // by whoever pressed "Deal roles" (see `startDeal` below). Every peer
+  // MUST derive roles from this synced value, never from its own local
+  // `mafiaCount` prop (a per-device Settings-drawer value) — otherwise two
+  // phones can compute a different number of mafia from the identical
+  // shuffle. `null` until a deal has been started in this room.
+  const [syncedMafiaCount, setSyncedMafiaCount] = useState<number | null>(null);
   const seedRef = useRef<string>("");
 
   const mesh = useMemo(() => {
@@ -35,8 +52,9 @@ export function Mafia({ roomId, myName, mafiaCount }: Props) {
     const yCommits = room.doc.getMap<Commit>("commits");
     const yReveals = room.doc.getMap<Reveal>("reveals");
     const yPhase = room.doc.getMap<{ phase: Phase }>("phase");
+    const yConfig = room.doc.getMap<number>("config");
     const id = crypto.randomUUID();
-    return { room, clock, yPlayers, yCommits, yReveals, yPhase, id };
+    return { room, clock, yPlayers, yCommits, yReveals, yPhase, yConfig, id };
   }, [armed, roomId]);
 
   useEffect(() => {
@@ -55,12 +73,14 @@ export function Mafia({ roomId, myName, mafiaCount }: Props) {
       setReveals(Object.fromEntries(mesh.yReveals.entries()));
       const p = mesh.yPhase.get("current")?.phase ?? "lobby";
       setPhase(p);
+      setSyncedMafiaCount(mesh.yConfig.get("mafiaCount") ?? null);
     };
 
     mesh.yPlayers.observe(refresh);
     mesh.yCommits.observe(refresh);
     mesh.yReveals.observe(refresh);
     mesh.yPhase.observe(refresh);
+    mesh.yConfig.observe(refresh);
     refresh();
 
     return () => {
@@ -68,6 +88,7 @@ export function Mafia({ roomId, myName, mafiaCount }: Props) {
       mesh.yCommits.unobserve(refresh);
       mesh.yReveals.unobserve(refresh);
       mesh.yPhase.unobserve(refresh);
+      mesh.yConfig.unobserve(refresh);
     };
   }, [mesh, myName]);
 
@@ -98,9 +119,13 @@ export function Mafia({ roomId, myName, mafiaCount }: Props) {
     mesh.yReveals.set(mesh.id, { seed: seedRef.current });
   }, [mesh, phase]);
 
-  // When all reveals in, derive role assignment
+  // When all reveals in, derive role assignment. `syncedMafiaCount` (not the
+  // local `mafiaCount` prop) is the source of truth for the deal so every
+  // peer's shuffle-truncation point agrees — see `startDeal` below and the
+  // comment on `roles.ts#computeMafiaCount`.
   useEffect(() => {
     if (!mesh || phase !== "reveal") return;
+    if (syncedMafiaCount == null) return;
     const ids = players.map((p) => p.id);
     if (ids.length === 0) return;
     if (!ids.every((id) => mesh.yReveals.has(id))) return;
@@ -118,24 +143,43 @@ export function Mafia({ roomId, myName, mafiaCount }: Props) {
       const seeds = ids.map((id) => mesh.yReveals.get(id)!.seed);
       const entropy = combineSeeds(seeds);
       const shuffled = await seededShuffle(ids, entropy);
-      const m = Math.max(1, Math.min(Math.floor(ids.length / 2), mafiaCount));
-      const next: Record<string, Role> = {};
-      shuffled.forEach((id, i) => {
-        next[id] = i < m ? "mafia" : "villager";
-      });
-      setRoles(next);
+      // `full` briefly holds every player's role in order to compute *my*
+      // role (and mafia teammates); it is intentionally never stored in
+      // React state — see the comment on the `myRole` / `mafiaTeammateIds`
+      // state declarations above.
+      const full = assignRoles(shuffled, syncedMafiaCount);
+      const mine = full[mesh.id];
+      setMyRole(mine);
+      setMafiaTeammateIds(
+        mine === "mafia"
+          ? Object.keys(full).filter((id) => id !== mesh.id && full[id] === "mafia")
+          : [],
+      );
     })();
-  }, [mesh, phase, players, mafiaCount, reveals, commitments]);
+  }, [mesh, phase, players, syncedMafiaCount, reveals, commitments]);
 
   const advance = (next: Phase) => mesh?.yPhase.set("current", { phase: next });
+  // Publish this device's `mafiaCount` as the SHARED value for the round
+  // before advancing to `commit`, so every peer derives roles from the same
+  // number instead of each phone's own (possibly stale/different) local
+  // Settings-drawer value.
+  const startDeal = () => {
+    if (!mesh) return;
+    mesh.room.doc.transact(() => {
+      mesh.yConfig.set("mafiaCount", mafiaCount);
+      mesh.yPhase.set("current", { phase: "commit" });
+    });
+  };
   const restart = () => {
     if (!mesh) return;
     mesh.room.doc.transact(() => {
       mesh.yCommits.clear();
       mesh.yReveals.clear();
+      mesh.yConfig.delete("mafiaCount");
       mesh.yPhase.set("current", { phase: "lobby" });
     });
-    setRoles({});
+    setMyRole(undefined);
+    setMafiaTeammateIds([]);
     seedRef.current = "";
   };
 
@@ -159,7 +203,6 @@ export function Mafia({ roomId, myName, mafiaCount }: Props) {
     );
   }
 
-  const myRole = roles[myId];
   const allCommitted = players.length > 0 && players.every((p) => p.id in commitments);
   const allRevealed = players.length > 0 && players.every((p) => p.id in reveals);
   const waitingOnCommit = players.filter((p) => !(p.id in commitments)).map((p) => p.name);
@@ -183,7 +226,7 @@ export function Mafia({ roomId, myName, mafiaCount }: Props) {
             ))}
           </ul>
           <p className="mafia-help">Need ≥ 4 players. {mafiaCount} mafia, rest villagers.</p>
-          <button type="button" disabled={players.length < 4} onClick={() => advance("commit")}>
+          <button type="button" disabled={players.length < 4} onClick={startDeal}>
             Deal roles
           </button>
         </div>
@@ -240,6 +283,14 @@ export function Mafia({ roomId, myName, mafiaCount }: Props) {
                 Look around the table — every red-glowing phone is a fellow mafia. Agree on a target
                 silently. When everyone has seen, hit <em>Morning</em>.
               </p>
+              {mafiaTeammateIds.length > 0 && (
+                <p className="mafia-help">
+                  Your fellow mafia:{" "}
+                  {mafiaTeammateIds
+                    .map((id) => players.find((p) => p.id === id)?.name ?? "?")
+                    .join(", ")}
+                </p>
+              )}
             </>
           ) : (
             <>
